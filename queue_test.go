@@ -19,35 +19,39 @@ import (
 
 func testDB(t *testing.T) *sql.DB {
 	t.Helper()
+	db := openIsolatedSchema(t, "test_jobqueue_")
+	if _, err := db.Exec(embeddedMigrationUpSQL(t)); err != nil {
+		t.Fatalf("create isolated jobs schema: %v", err)
+	}
+	return db
+}
+
+func openIsolatedSchema(t *testing.T, prefix string) *sql.DB {
+	t.Helper()
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {
 		databaseURL = "postgres://localhost:5432/postgres?sslmode=disable"
 	}
-	db, err := sql.Open("pgx", databaseURL)
+	admin, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Ping(); err != nil {
-		_ = db.Close()
+	if err := admin.Ping(); err != nil {
+		_ = admin.Close()
 		if os.Getenv("TEST_DATABASE_URL") != "" {
 			t.Fatalf("configured postgres unavailable: %v", err)
 		}
 		t.Skipf("postgres unavailable: %v", err)
 	}
-	schema := "test_jobqueue_" + newTestID(t)
-	if _, err := db.Exec(`CREATE SCHEMA ` + schema); err != nil {
-		_ = db.Close()
+	schema := prefix + newTestID(t)
+	if _, err := admin.Exec(`CREATE SCHEMA ` + schema); err != nil {
+		_ = admin.Close()
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`SET search_path TO ` + schema + `, public`); err != nil {
-		_ = db.Close()
+	if _, err := admin.Exec(`SET search_path TO ` + schema + `, public`); err != nil {
+		_ = admin.Close()
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(embeddedMigrationUpSQL(t)); err != nil {
-		_ = db.Close()
-		t.Fatalf("create isolated jobs schema: %v", err)
-	}
-	adminDB := db
 	parsed, err := url.Parse(databaseURL)
 	if err != nil {
 		t.Fatal(err)
@@ -55,7 +59,7 @@ func testDB(t *testing.T) *sql.DB {
 	query := parsed.Query()
 	query.Set("options", "-csearch_path="+schema+",public")
 	parsed.RawQuery = query.Encode()
-	db, err = sql.Open("pgx", parsed.String())
+	db, err := sql.Open("pgx", parsed.String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,8 +68,8 @@ func testDB(t *testing.T) *sql.DB {
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		_, _ = adminDB.Exec(`DROP SCHEMA ` + schema + ` CASCADE`)
-		_ = adminDB.Close()
+		_, _ = admin.Exec(`DROP SCHEMA ` + schema + ` CASCADE`)
+		_ = admin.Close()
 	})
 	return db
 }
