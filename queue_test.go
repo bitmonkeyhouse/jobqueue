@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"strings"
@@ -15,13 +16,14 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3"
 )
 
 func testDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db := openIsolatedSchema(t, "test_jobqueue_")
-	if _, err := db.Exec(embeddedMigrationUpSQL(t)); err != nil {
-		t.Fatalf("create isolated jobs schema: %v", err)
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatalf("migrate isolated jobs schema: %v", err)
 	}
 	return db
 }
@@ -74,14 +76,30 @@ func openIsolatedSchema(t *testing.T, prefix string) *sql.DB {
 	return db
 }
 
-func embeddedMigrationUpSQL(t *testing.T) string {
+// testDBAtVersion migrates an isolated schema up to a specific goose version so a
+// test can build a v0.1.0 database and exercise the upgrade path.
+func testDBAtVersion(t *testing.T, version int64) *sql.DB {
 	t.Helper()
-	data, err := migrationsFS.ReadFile("migrations/00001_create_jobs.sql")
-	if err != nil {
-		t.Fatal(err)
+	db := openIsolatedSchema(t, "test_jobqueue_at_")
+	if err := migrateTo(t, db, version); err != nil {
+		t.Fatalf("migrate to version %d: %v", version, err)
 	}
-	up := strings.Split(string(data), "-- +goose Down")[0]
-	return strings.Replace(up, "-- +goose Up", "", 1)
+	return db
+}
+
+func migrateTo(t *testing.T, db *sql.DB, version int64) error {
+	t.Helper()
+	fsys, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		return err
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, fsys,
+		goose.WithTableName(MigrationTable))
+	if err != nil {
+		return err
+	}
+	_, err = provider.UpTo(context.Background(), version)
+	return err
 }
 
 func newTestID(t *testing.T) string {
