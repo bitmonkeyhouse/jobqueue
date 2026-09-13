@@ -297,7 +297,8 @@ func completeJob(ctx context.Context, db *sql.DB, job Job) error {
 	result, err := tx.ExecContext(ctx, `
 UPDATE jobs
 SET status='completed', payload=$3::jsonb, completed_at=clock_timestamp(),
-    reserved_at=NULL, reservation_id=NULL, last_error=NULL, updated_at=clock_timestamp()
+    reserved_at=NULL, reservation_id=NULL, worker_id=NULL, heartbeat_at=NULL,
+    lease_expires_at=NULL, last_error=NULL, updated_at=clock_timestamp()
 WHERE id=$1 AND status='reserved' AND reservation_id=$2`, job.ID, job.ReservationID, redacted)
 	if err := fencedResult(result, err); err != nil {
 		return err
@@ -323,6 +324,11 @@ func settleFailure(ctx context.Context, db *sql.DB, job Job, diagnostic failureD
 	if err != nil {
 		redacted = terminalRedactionFallback(command)
 	}
+	// MaxAttempts counts execution claims: once the cap is consumed a handler
+	// failure is terminal, never retried.
+	if job.MaxAttempts > 0 && job.Attempts >= job.MaxAttempts {
+		retryAfter = nil
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -335,7 +341,8 @@ func settleFailure(ctx context.Context, db *sql.DB, job Job, diagnostic failureD
 		err = tx.QueryRowContext(ctx, `
 UPDATE jobs
 SET status='failed', payload=$3::jsonb, failed_at=clock_timestamp(),
-    reserved_at=NULL, reservation_id=NULL, last_error=$4, updated_at=clock_timestamp()
+    reserved_at=NULL, reservation_id=NULL, worker_id=NULL, heartbeat_at=NULL,
+    lease_expires_at=NULL, last_error=$4, updated_at=clock_timestamp()
 WHERE id=$1 AND status='reserved' AND reservation_id=$2
 RETURNING true,retry_attempts`, job.ID, job.ReservationID, redacted, diagnostic.summary()).Scan(&terminal, &retryAttempts)
 	} else {
@@ -347,7 +354,8 @@ SET status=CASE WHEN operation.now+$3::interval <= retry_until THEN 'available' 
     available_at=CASE WHEN operation.now+$3::interval <= retry_until THEN operation.now+$3::interval ELSE available_at END,
     retry_attempts=retry_attempts+CASE WHEN operation.now+$3::interval <= retry_until THEN 1 ELSE 0 END,
     failed_at=CASE WHEN operation.now+$3::interval <= retry_until THEN NULL ELSE operation.now END,
-    reserved_at=NULL, reservation_id=NULL, last_error=$5, updated_at=operation.now
+    reserved_at=NULL, reservation_id=NULL, worker_id=NULL, heartbeat_at=NULL,
+    lease_expires_at=NULL, last_error=$5, updated_at=operation.now
 FROM operation
 WHERE jobs.id=$1 AND status='reserved' AND reservation_id=$2
 RETURNING status='failed',retry_attempts`, job.ID, job.ReservationID, durationInterval(*retryAfter), redacted, diagnostic.summary()).Scan(&terminal, &retryAttempts)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"strings"
 	"sync"
@@ -101,6 +102,10 @@ type Worker struct {
 
 	cancelMu   sync.Mutex
 	cancelWake chan struct{}
+
+	// jitter, when set, replaces the default ±20% retry backoff jitter. Tests use
+	// it for deterministic timing.
+	jitter func(time.Duration) time.Duration
 }
 
 // leaseWatch records what happened to a running job's lease so settlement can
@@ -323,7 +328,7 @@ func (w *Worker) processNext(handlerCtx, lifecycleCtx context.Context) (bool, er
 	if errors.As(handlerErr, &permanent) {
 		return true, w.settle(settleFailure(settleCtx, w.DB, job, diagnostic, nil), job)
 	}
-	backoff := retryBackoff(job.RetryAttempts + 1)
+	backoff := w.backoffFor(job.RetryAttempts + 1)
 	return true, w.settle(settleFailure(settleCtx, w.DB, job, diagnostic, &backoff), job)
 }
 
@@ -639,6 +644,26 @@ func (w *Worker) runReaper(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// backoffFor returns the retry delay with bounded ±20% jitter so a batch of
+// failures does not retry in lockstep.
+func (w *Worker) backoffFor(attempt int) time.Duration {
+	base := retryBackoff(attempt)
+	jitter := w.jitter
+	if jitter == nil {
+		jitter = defaultJitter
+	}
+	return jitter(base)
+}
+
+func defaultJitter(base time.Duration) time.Duration {
+	const maxDuration = time.Duration(1<<63 - 1)
+	if base <= 0 || base > maxDuration/2 {
+		return base
+	}
+	offset := (rand.Float64()*2 - 1) * 0.2 * float64(base)
+	return time.Duration(float64(base) + offset)
 }
 
 func retryBackoff(attempt int) time.Duration {

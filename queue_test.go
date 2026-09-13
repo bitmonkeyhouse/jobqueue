@@ -260,7 +260,8 @@ func TestReservationReclaimsDoNotAdvanceHandlerFailureBackoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := time.Now()
-	processed, err := (&Worker{DB: db, Registry: registry}).ProcessNext(context.Background())
+	worker := &Worker{DB: db, Registry: registry, jitter: func(d time.Duration) time.Duration { return d }}
+	processed, err := worker.ProcessNext(context.Background())
 	if err != nil || !processed {
 		t.Fatalf("ProcessNext = %v, %v", processed, err)
 	}
@@ -465,7 +466,7 @@ func TestWorkerSuccessRetryDeadlineAndUnknownCommand(t *testing.T) {
 	var successCalls atomic.Int32
 	_ = registry.Register("success", func(context.Context, []byte) error { successCalls.Add(1); return nil })
 	_ = registry.Register("retry", func(context.Context, []byte) error { return errors.New("provider secret body") })
-	worker := &Worker{DB: db, Registry: registry}
+	worker := &Worker{DB: db, Registry: registry, jitter: func(d time.Duration) time.Duration { return d }}
 	if _, err := dispatcher.Dispatch(context.Background(), "success", map[string]string{"token": "secret-token"}, SensitiveArguments(), Metadata(map[string]any{"kind": "safe"})); err != nil {
 		t.Fatal(err)
 	}
