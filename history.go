@@ -68,17 +68,22 @@ type sqlExecer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-func insertEvent(ctx context.Context, execer sqlExecer, jobID int64, eventType JobEventType, detail map[string]any) error {
+// insertEventSQL is shared by the database/sql and pgx paths.
+const insertEventSQL = `INSERT INTO job_events (job_id, type, detail) VALUES ($1,$2,$3::jsonb)`
+
+func encodeEventDetail(detail map[string]any) ([]byte, error) {
 	if detail == nil {
 		detail = map[string]any{}
 	}
-	encoded, err := json.Marshal(detail)
+	return json.Marshal(detail)
+}
+
+func insertEvent(ctx context.Context, execer sqlExecer, jobID int64, eventType JobEventType, detail map[string]any) error {
+	encoded, err := encodeEventDetail(detail)
 	if err != nil {
 		return fmt.Errorf("encode job event detail: %w", err)
 	}
-	if _, err := execer.ExecContext(ctx,
-		`INSERT INTO job_events (job_id, type, detail) VALUES ($1,$2,$3::jsonb)`,
-		jobID, string(eventType), encoded); err != nil {
+	if _, err := execer.ExecContext(ctx, insertEventSQL, jobID, string(eventType), encoded); err != nil {
 		return fmt.Errorf("insert job event %s: %w", eventType, err)
 	}
 	return nil

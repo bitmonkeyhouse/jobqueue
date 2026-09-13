@@ -44,17 +44,9 @@ func (d *QueueDispatcher) DispatchTx(ctx context.Context, tx *sql.Tx, command st
 	return insertJob(ctx, tx, command, arguments, options...)
 }
 
-// insertJob writes the job and its enqueued event in the caller's transaction.
-// An idempotency conflict returns the existing active job's id without a second
-// job or event. xmax=0 identifies a genuinely new row.
-func insertJob(ctx context.Context, tx *sql.Tx, command string, arguments any, options ...Option) (int64, error) {
-	payload, cfg, err := buildPayload(command, arguments, options...)
-	if err != nil {
-		return 0, err
-	}
-	var id int64
-	var inserted bool
-	err = tx.QueryRowContext(ctx, `
+// insertJobSQL is shared by the database/sql and pgx enqueue paths so both
+// drivers have identical semantics. xmax=0 identifies a genuinely new row.
+const insertJobSQL = `
 WITH operation AS (SELECT clock_timestamp() AS now)
 INSERT INTO jobs (queue, payload, available_at, retry_until, idempotency_key)
 SELECT $1, $2::jsonb,
@@ -64,7 +56,19 @@ SELECT $1, $2::jsonb,
 FROM operation
 ON CONFLICT (queue, idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('available', 'reserved')
 DO UPDATE SET updated_at = jobs.updated_at
-RETURNING id, (xmax = 0) AS inserted`, cfg.queue, payload, durationInterval(time.Duration(cfg.delayNanos)), durationInterval(time.Duration(cfg.retryWindowNanos)), cfg.idempotencyKey).Scan(&id, &inserted)
+RETURNING id, (xmax = 0) AS inserted`
+
+// insertJob writes the job and its enqueued event in the caller's transaction.
+// An idempotency conflict returns the existing active job's id without a second
+// job or event.
+func insertJob(ctx context.Context, tx *sql.Tx, command string, arguments any, options ...Option) (int64, error) {
+	payload, cfg, err := buildPayload(command, arguments, options...)
+	if err != nil {
+		return 0, err
+	}
+	var id int64
+	var inserted bool
+	err = tx.QueryRowContext(ctx, insertJobSQL, cfg.queue, payload, durationInterval(time.Duration(cfg.delayNanos)), durationInterval(time.Duration(cfg.retryWindowNanos)), cfg.idempotencyKey).Scan(&id, &inserted)
 	if err != nil {
 		return 0, fmt.Errorf("insert job: %w", err)
 	}

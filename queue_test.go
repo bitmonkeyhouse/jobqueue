@@ -29,6 +29,13 @@ func testDB(t *testing.T) *sql.DB {
 }
 
 func openIsolatedSchema(t *testing.T, prefix string) *sql.DB {
+	db, _ := openIsolatedSchemaWithDSN(t, prefix)
+	return db
+}
+
+// openIsolatedSchemaWithDSN also returns the isolated-schema DSN so a test can
+// open a pgx pool against the same schema.
+func openIsolatedSchemaWithDSN(t *testing.T, prefix string) (*sql.DB, string) {
 	t.Helper()
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {
@@ -73,7 +80,7 @@ func openIsolatedSchema(t *testing.T, prefix string) *sql.DB {
 		_, _ = admin.Exec(`DROP SCHEMA ` + schema + ` CASCADE`)
 		_ = admin.Close()
 	})
-	return db
+	return db, parsed.String()
 }
 
 // testDBAtVersion migrates an isolated schema up to a specific goose version so a
