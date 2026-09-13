@@ -44,16 +44,25 @@ func (d *QueueDispatcher) DispatchTx(ctx context.Context, tx *sql.Tx, command st
 	return insertJob(ctx, tx, command, arguments, options...)
 }
 
+// ensureQueueSQL creates a queue with safe generic defaults on first use. It
+// never overwrites an explicitly registered queue.
+const ensureQueueSQL = `INSERT INTO job_queues (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`
+
 // insertJobSQL is shared by the database/sql and pgx enqueue paths so both
 // drivers have identical semantics. xmax=0 identifies a genuinely new row.
 const insertJobSQL = `
 WITH operation AS (SELECT clock_timestamp() AS now)
-INSERT INTO jobs (queue, payload, available_at, retry_until, idempotency_key)
+INSERT INTO jobs (queue, payload, available_at, retry_until, idempotency_key,
+                  sequence_key, sequence_concurrency, max_attempts)
 SELECT $1, $2::jsonb,
        operation.now + $3::interval,
        operation.now + $3::interval + $4::interval,
-       NULLIF($5, '')
+       NULLIF($5, ''),
+       NULLIF($6, ''),
+       COALESCE(NULLIF($7, 0), q.sequence_concurrency),
+       $8
 FROM operation
+JOIN job_queues q ON q.name = $1
 ON CONFLICT (queue, idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('available', 'reserved')
 DO UPDATE SET updated_at = jobs.updated_at
 RETURNING id, (xmax = 0) AS inserted`
@@ -66,9 +75,15 @@ func insertJob(ctx context.Context, tx *sql.Tx, command string, arguments any, o
 	if err != nil {
 		return 0, err
 	}
+	if _, err := tx.ExecContext(ctx, ensureQueueSQL, cfg.queue); err != nil {
+		return 0, fmt.Errorf("ensure job queue: %w", err)
+	}
 	var id int64
 	var inserted bool
-	err = tx.QueryRowContext(ctx, insertJobSQL, cfg.queue, payload, durationInterval(time.Duration(cfg.delayNanos)), durationInterval(time.Duration(cfg.retryWindowNanos)), cfg.idempotencyKey).Scan(&id, &inserted)
+	err = tx.QueryRowContext(ctx, insertJobSQL, cfg.queue, payload,
+		durationInterval(time.Duration(cfg.delayNanos)),
+		durationInterval(time.Duration(cfg.retryWindowNanos)),
+		cfg.idempotencyKey, cfg.sequenceKey, cfg.sequenceConcurrency, cfg.maxAttempts).Scan(&id, &inserted)
 	if err != nil {
 		return 0, fmt.Errorf("insert job: %w", err)
 	}
@@ -81,18 +96,21 @@ func insertJob(ctx context.Context, tx *sql.Tx, command string, arguments any, o
 }
 
 type Job struct {
-	ID            int64
-	Queue         string
-	Payload       json.RawMessage
-	Command       string
-	Arguments     json.RawMessage
-	Attempts      int
-	RetryAttempts int
-	AvailableAt   time.Time
-	RetryUntil    time.Time
-	ReservedAt    time.Time
-	ReservationID string
-	WorkerID      string
+	ID                  int64
+	Queue               string
+	Payload             json.RawMessage
+	Command             string
+	Arguments           json.RawMessage
+	Attempts            int
+	RetryAttempts       int
+	MaxAttempts         int
+	AvailableAt         time.Time
+	RetryUntil          time.Time
+	ReservedAt          time.Time
+	ReservationID       string
+	WorkerID            string
+	SequenceKey         string
+	SequenceConcurrency int
 }
 
 func claimExpiredDeadline(ctx context.Context, db *sql.DB, queue string, reservationExpiry time.Duration) (Job, error) {
@@ -138,18 +156,42 @@ func claimNext(ctx context.Context, db *sql.DB, queue string, reservationExpiry 
 	if err != nil {
 		return Job{}, err
 	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return Job{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Serialise claims per queue so the capacity counts below are accurate. The
+	// count is cheap and claims are short; per-key locking is the upgrade path if
+	// claim throughput on one queue ever matters.
+	// ponytail: queue-wide advisory lock; switch to per-sequence-key locks if throughput matters.
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, queueLockKey(queue)); err != nil {
+		return Job{}, fmt.Errorf("lock job queue: %w", err)
+	}
 	var job Job
-	err = db.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 WITH candidate AS (
-    SELECT id
-    FROM jobs
-    WHERE queue = $1
-      AND retry_until >= clock_timestamp()
+    SELECT j.id
+    FROM jobs j
+    JOIN job_queues q ON q.name = j.queue
+    WHERE j.queue = $1
+      AND j.retry_until >= clock_timestamp()
       AND (
-        (status = 'available' AND available_at <= clock_timestamp())
-        OR (status = 'reserved' AND reserved_at <= clock_timestamp() - $2::interval)
+        (j.status = 'available' AND j.available_at <= clock_timestamp())
+        OR (j.status = 'reserved' AND j.reserved_at <= clock_timestamp() - $2::interval)
       )
-    ORDER BY available_at ASC, id ASC
+      AND (
+        q.max_concurrency IS NULL
+        OR (SELECT count(*) FROM jobs r
+            WHERE r.queue = j.queue AND r.status = 'reserved') < q.max_concurrency
+      )
+      AND (
+        j.sequence_key IS NULL
+        OR (SELECT count(*) FROM jobs r
+            WHERE r.queue = j.queue AND r.sequence_key = j.sequence_key
+              AND r.status = 'reserved') < j.sequence_concurrency
+      )
+    ORDER BY j.available_at ASC, j.id ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 ),
@@ -160,7 +202,8 @@ claimed AS (
     FROM candidate
     WHERE jobs.id=candidate.id
     RETURNING jobs.id, jobs.queue, jobs.payload, jobs.attempts, jobs.retry_attempts,
-              jobs.available_at, jobs.retry_until, jobs.reserved_at, jobs.reservation_id
+              jobs.max_attempts, jobs.available_at, jobs.retry_until, jobs.reserved_at,
+              jobs.reservation_id, jobs.sequence_key, jobs.sequence_concurrency
 ),
 attempt AS (
     INSERT INTO job_attempts (job_id, queue, attempt, claimed_at)
@@ -170,18 +213,27 @@ event AS (
     INSERT INTO job_events (job_id, type, detail)
     SELECT id, 'claimed', jsonb_build_object('attempt', attempts) FROM claimed
 )
-SELECT id, queue, payload, attempts, retry_attempts, available_at, retry_until, reserved_at, reservation_id
+SELECT id, queue, payload, attempts, retry_attempts, max_attempts, available_at,
+       retry_until, reserved_at, reservation_id, COALESCE(sequence_key, ''), sequence_concurrency
 FROM claimed`, queue, durationInterval(reservationExpiry), reservationID).Scan(
 		&job.ID, &job.Queue, &job.Payload, &job.Attempts, &job.RetryAttempts,
-		&job.AvailableAt, &job.RetryUntil, &job.ReservedAt, &job.ReservationID,
+		&job.MaxAttempts, &job.AvailableAt, &job.RetryUntil, &job.ReservedAt,
+		&job.ReservationID, &job.SequenceKey, &job.SequenceConcurrency,
 	)
 	if err != nil {
 		return Job{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Job{}, fmt.Errorf("commit job claim: %w", err)
 	}
 	if err := decodeJobPayload(&job); err != nil {
 		return job, err
 	}
 	return job, nil
+}
+
+func queueLockKey(queue string) string {
+	return "jobqueue.queue:" + queue
 }
 
 func decodeJobPayload(job *Job) error {

@@ -31,12 +31,16 @@ func EnqueueTx(ctx context.Context, tx PgxTx, command string, arguments any, opt
 	if err != nil {
 		return 0, err
 	}
+	if _, err := tx.Exec(ctx, ensureQueueSQL, cfg.queue); err != nil {
+		return 0, fmt.Errorf("ensure job queue: %w", err)
+	}
 	var id int64
 	var inserted bool
 	if err := tx.QueryRow(ctx, insertJobSQL, cfg.queue, payload,
 		durationInterval(time.Duration(cfg.delayNanos)),
 		durationInterval(time.Duration(cfg.retryWindowNanos)),
-		cfg.idempotencyKey).Scan(&id, &inserted); err != nil {
+		cfg.idempotencyKey, cfg.sequenceKey, cfg.sequenceConcurrency,
+		cfg.maxAttempts).Scan(&id, &inserted); err != nil {
 		return 0, fmt.Errorf("insert job: %w", err)
 	}
 	if inserted {

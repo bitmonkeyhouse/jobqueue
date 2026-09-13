@@ -23,12 +23,15 @@ type Payload struct {
 }
 
 type dispatchConfig struct {
-	queue            string
-	delayNanos       int64
-	retryWindowNanos int64
-	idempotencyKey   string
-	sensitive        []string
-	metadata         map[string]any
+	queue               string
+	delayNanos          int64
+	retryWindowNanos    int64
+	idempotencyKey      string
+	sensitive           []string
+	metadata            map[string]any
+	sequenceKey         string
+	sequenceConcurrency int
+	maxAttempts         int
 }
 
 type Option func(*dispatchConfig) error
@@ -99,6 +102,43 @@ func Metadata(values map[string]any) Option {
 			return fmt.Errorf("clone job metadata: %w", err)
 		}
 		c.metadata = cloned
+		return nil
+	}
+}
+
+// SequenceKey groups related jobs so at most SequenceConcurrency of them run at
+// once. The key is opaque text; the queue has no concept of projects.
+func SequenceKey(key string) Option {
+	normalized := strings.TrimSpace(key)
+	return func(c *dispatchConfig) error {
+		if normalized == "" {
+			return errors.New("sequence key is required")
+		}
+		c.sequenceKey = normalized
+		return nil
+	}
+}
+
+// SequenceConcurrency overrides the queue's default for jobs sharing this job's
+// sequence key. Zero leaves the queue default in place.
+func SequenceConcurrency(limit int) Option {
+	return func(c *dispatchConfig) error {
+		if limit < 0 {
+			return errors.New("sequence concurrency cannot be negative")
+		}
+		c.sequenceConcurrency = limit
+		return nil
+	}
+}
+
+// MaxAttempts caps execution claims: MaxAttempts(1) means the handler runs at
+// most once. Zero (the default) keeps window-bounded retries.
+func MaxAttempts(limit int) Option {
+	return func(c *dispatchConfig) error {
+		if limit < 0 {
+			return errors.New("max attempts cannot be negative")
+		}
+		c.maxAttempts = limit
 		return nil
 	}
 }
