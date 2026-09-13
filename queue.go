@@ -185,6 +185,7 @@ WITH candidate AS (
     JOIN job_queues q ON q.name = j.queue
     WHERE j.queue = $1
       AND j.retry_until >= clock_timestamp()
+      AND j.cancel_requested_at IS NULL
       AND (j.max_attempts = 0 OR j.attempts < j.max_attempts)
       AND (
         (j.status = 'available' AND j.available_at <= clock_timestamp())
@@ -370,6 +371,37 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, job.ID, job.Queue, command, job.Attempts, ret
 		eventType = EventFailed
 	}
 	if err := insertEvent(ctx, tx, job.ID, eventType, attemptDetail(job, diagnostic.Code)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// settleCancelled marks a reserved job terminally cancelled. It is fenced by the
+// current reservation, so a job that already completed or failed is left alone.
+func settleCancelled(ctx context.Context, db *sql.DB, job Job) error {
+	redacted, err := redactPayload(job.Payload)
+	if err != nil {
+		redacted = terminalRedactionFallback(job.Command)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `
+UPDATE jobs
+SET status='cancelled', payload=$3::jsonb, cancelled_at=clock_timestamp(),
+    reserved_at=NULL, reservation_id=NULL, worker_id=NULL, heartbeat_at=NULL,
+    lease_expires_at=NULL, last_error=NULL, updated_at=clock_timestamp()
+WHERE id=$1 AND status='reserved' AND reservation_id=$2`, job.ID, job.ReservationID, redacted)
+	if err := fencedResult(result, err); err != nil {
+		return err
+	}
+	if err := finishAttempt(ctx, tx, job.ID, job.Attempts, OutcomeCancelled,
+		"job_cancelled", "job was cancelled while running"); err != nil {
+		return err
+	}
+	if err := insertEvent(ctx, tx, job.ID, EventCancelled, attemptDetail(job, "job_cancelled")); err != nil {
 		return err
 	}
 	return tx.Commit()

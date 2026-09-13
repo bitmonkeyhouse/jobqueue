@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -97,6 +98,16 @@ type Worker struct {
 	ShutdownGrace     time.Duration
 	SettlementTimeout time.Duration
 	Logger            *slog.Logger
+
+	cancelMu   sync.Mutex
+	cancelWake chan struct{}
+}
+
+// leaseWatch records what happened to a running job's lease so settlement can
+// distinguish cancellation from lease loss and unclean shutdown.
+type leaseWatch struct {
+	cancelRequested atomic.Bool
+	leaseLost       atomic.Bool
 }
 
 func (w *Worker) Run(ctx context.Context) error {
@@ -123,6 +134,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 
 	notifications := w.startListener(consumerCtx)
+	w.startCancelListener(consumerCtx)
 	go w.runReaper(consumerCtx)
 	broadcastWake(wakes)
 
@@ -279,11 +291,15 @@ func (w *Worker) processNext(handlerCtx, lifecycleCtx context.Context) (bool, er
 	}
 
 	handler, ok := w.Registry.handler(job.Command)
-	var handlerErr error
+	var (
+		handlerErr error
+		watch      *leaseWatch
+	)
 	if !ok {
 		handlerErr = Permanent(Diagnostic("unknown_command", "no handler is registered for the job command", errors.New("unknown job command")))
 	} else {
-		leaseCtx, stopHeartbeat := w.startHeartbeat(handlerCtx, job)
+		leaseCtx, leaseWatch, stopHeartbeat := w.startHeartbeat(handlerCtx, job)
+		watch = leaseWatch
 		jobCtx, cancel := context.WithTimeout(leaseCtx, w.jobTimeout())
 		handlerErr = handler(jobCtx, job.Arguments)
 		if handlerErr == nil {
@@ -296,6 +312,10 @@ func (w *Worker) processNext(handlerCtx, lifecycleCtx context.Context) (bool, er
 	defer cancel()
 	if handlerErr == nil {
 		return true, w.settle(completeJob(settleCtx, w.DB, job), job)
+	}
+	if watch != nil && watch.cancelRequested.Load() {
+		w.logger().Info("job cancellation propagated to handler", "job_id", job.ID, "queue", job.Queue)
+		return true, w.settle(settleCancelled(settleCtx, w.DB, job), job)
 	}
 	w.logFailure(job, handlerErr)
 	diagnostic := diagnosticForError(handlerErr)
@@ -459,11 +479,13 @@ func (w *Worker) logger() *slog.Logger {
 }
 
 // startHeartbeat renews the claimed job's lease on an interval until the
-// returned stop func is called. If the lease is genuinely lost (the claim was
-// reclaimed by another owner), it records lease_lost and cancels the returned
-// context so the handler stops. Transient database errors are retried.
-func (w *Worker) startHeartbeat(parent context.Context, job Job) (context.Context, func()) {
+// returned stop func is called, and wakes immediately when a cancellation
+// notification arrives. It reports cancellation and lease loss through the
+// returned leaseWatch and cancels the returned context so the handler stops.
+// Transient database errors are retried.
+func (w *Worker) startHeartbeat(parent context.Context, job Job) (context.Context, *leaseWatch, func()) {
 	ctx, cancel := context.WithCancel(parent)
+	watch := &leaseWatch{}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -473,55 +495,97 @@ func (w *Worker) startHeartbeat(parent context.Context, job Job) (context.Contex
 			select {
 			case <-ctx.Done():
 				return
+			case <-w.cancelSignal():
+				if w.heartbeatOnce(ctx, job, watch) {
+					cancel()
+					return
+				}
 			case <-ticker.C:
-				err := w.renewLease(ctx, job)
-				if err == nil {
-					continue
+				if w.heartbeatOnce(ctx, job, watch) {
+					cancel()
+					return
 				}
-				if !errors.Is(err, ErrStaleReservation) {
-					w.logger().Warn("job lease renewal failed", "job_id", job.ID, "queue", job.Queue, "error", err)
-					continue
-				}
-				w.logger().Warn("job lease lost; cancelling handler",
-					"job_id", job.ID, "queue", job.Queue, "worker_id", w.workerID())
-				w.recordLeaseLost(job)
-				cancel()
-				return
 			}
 		}
 	}()
-	return ctx, func() {
+	return ctx, watch, func() {
 		cancel()
 		<-done
 	}
 }
 
-func (w *Worker) renewLease(ctx context.Context, job Job) error {
-	result, err := w.DB.ExecContext(ctx, `
+// heartbeatOnce renews the lease and reports whether the handler should stop
+// (lease lost, or cancellation requested). Transient errors are logged and
+// treated as "keep going".
+func (w *Worker) heartbeatOnce(ctx context.Context, job Job, watch *leaseWatch) bool {
+	cancelRequested, err := w.renewLease(ctx, job)
+	if err == nil {
+		if cancelRequested {
+			watch.cancelRequested.Store(true)
+			w.logger().Info("job cancellation requested; cancelling handler",
+				"job_id", job.ID, "queue", job.Queue)
+			return true
+		}
+		return false
+	}
+	if !errors.Is(err, ErrStaleReservation) {
+		w.logger().Warn("job lease renewal failed", "job_id", job.ID, "queue", job.Queue, "error", err)
+		return false
+	}
+	watch.leaseLost.Store(true)
+	w.logger().Warn("job lease lost; cancelling handler",
+		"job_id", job.ID, "queue", job.Queue, "worker_id", w.workerID())
+	w.recordLeaseLost(job)
+	return true
+}
+
+func (w *Worker) renewLease(ctx context.Context, job Job) (bool, error) {
+	var cancelRequested bool
+	err := w.DB.QueryRowContext(ctx, `
 UPDATE jobs
 SET lease_expires_at=clock_timestamp() + $3::interval,
     heartbeat_at=clock_timestamp(), updated_at=clock_timestamp()
-WHERE id=$1 AND status='reserved' AND reservation_id=$2 AND worker_id=$4`,
-		job.ID, job.ReservationID, durationInterval(w.leaseDuration()), w.workerID())
-	if err != nil {
-		return err
+WHERE id=$1 AND status='reserved' AND reservation_id=$2 AND worker_id=$4
+RETURNING cancel_requested_at IS NOT NULL`,
+		job.ID, job.ReservationID, durationInterval(w.leaseDuration()), w.workerID()).Scan(&cancelRequested)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrStaleReservation
 	}
-	affected, err := result.RowsAffected()
 	if err != nil {
-		return err
-	}
-	if affected != 1 {
-		return ErrStaleReservation
+		return false, err
 	}
 	if _, err := w.DB.ExecContext(ctx, `
 UPDATE job_attempts SET heartbeat_at=clock_timestamp()
 WHERE job_id=$1 AND attempt=$2 AND outcome IS NULL`, job.ID, job.Attempts); err != nil {
-		return err
+		return cancelRequested, err
 	}
-	return insertEvent(ctx, w.DB, job.ID, EventLeaseRenewed, map[string]any{
+	if err := insertEvent(ctx, w.DB, job.ID, EventLeaseRenewed, map[string]any{
 		"attempt":   job.Attempts,
 		"worker_id": w.workerID(),
-	})
+	}); err != nil {
+		return cancelRequested, err
+	}
+	return cancelRequested, nil
+}
+
+// cancelSignal returns the current broadcast channel. Closing it wakes every
+// waiting heartbeat; broadcastCancel then installs a fresh channel.
+func (w *Worker) cancelSignal() <-chan struct{} {
+	w.cancelMu.Lock()
+	defer w.cancelMu.Unlock()
+	if w.cancelWake == nil {
+		w.cancelWake = make(chan struct{})
+	}
+	return w.cancelWake
+}
+
+func (w *Worker) broadcastCancel() {
+	w.cancelMu.Lock()
+	defer w.cancelMu.Unlock()
+	if w.cancelWake != nil {
+		close(w.cancelWake)
+	}
+	w.cancelWake = make(chan struct{})
 }
 
 func (w *Worker) recordLeaseLost(job Job) {
@@ -533,6 +597,31 @@ func (w *Worker) recordLeaseLost(job Job) {
 	}); err != nil {
 		w.logger().Warn("record job lease loss failed", "job_id", job.ID, "queue", job.Queue, "error", err)
 	}
+}
+
+// startCancelListener LISTENs on the library-owned cancellation channel and
+// broadcasts a wake to every running heartbeat. Cancellation state is durable,
+// so this only reduces latency; a missed notification is caught on the next
+// heartbeat or by Reap.
+func (w *Worker) startCancelListener(ctx context.Context) {
+	dsn := strings.TrimSpace(w.DatabaseURL)
+	if dsn == "" {
+		return
+	}
+	notifications := make(chan string, 1)
+	go w.runListener(ctx, dsn, DefaultCancelChannel, notifications)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case payload, ok := <-notifications:
+				if !ok || notificationRequiresWake(payload, w.queue()) {
+					w.broadcastCancel()
+				}
+			}
+		}
+	}()
 }
 
 // runReaper periodically reconciles expired leases for this worker's queue so

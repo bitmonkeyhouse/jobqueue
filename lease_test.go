@@ -55,7 +55,7 @@ func TestHeartbeatPreventsTheft(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, stop := worker.startHeartbeat(ctx, job)
+	_, _, stop := worker.startHeartbeat(ctx, job)
 	time.Sleep(500 * time.Millisecond) // longer than the initial lease
 	stop()
 	if _, err := claimNext(ctx, db, DefaultQueue, 300*time.Millisecond); !errors.Is(err, sql.ErrNoRows) {
@@ -100,7 +100,7 @@ func TestStaleOwnerCannotRenewReclaimedLease(t *testing.T) {
 	if _, err := Reap(ctx, db, ReapOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := worker.renewLease(ctx, job); !errors.Is(err, ErrStaleReservation) {
+	if _, err := worker.renewLease(ctx, job); !errors.Is(err, ErrStaleReservation) {
 		t.Fatalf("stale renewal error = %v, want ErrStaleReservation", err)
 	}
 }
