@@ -140,6 +140,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 	notifications := w.startListener(consumerCtx)
 	w.startCancelListener(consumerCtx)
+	w.warnDeprecatedNotifyChannel()
 	go w.runReaper(consumerCtx)
 	broadcastWake(wakes)
 
@@ -412,11 +413,22 @@ func (w *Worker) queue() string {
 	}
 	return strings.TrimSpace(w.Queue)
 }
+
+// notifyChannel returns the library-owned wake-up channel. Worker.NotifyChannel
+// is deprecated and ignored: the migration trigger only ever notifies on the
+// library channel, so honouring a custom value would silently drop wake-ups.
 func (w *Worker) notifyChannel() string {
-	if strings.TrimSpace(w.NotifyChannel) == "" {
-		return DefaultNotifyChannel
+	return DefaultNotifyChannel
+}
+
+// warnDeprecatedNotifyChannel makes the ignored configuration visible instead of
+// silently doing nothing.
+func (w *Worker) warnDeprecatedNotifyChannel() {
+	configured := strings.TrimSpace(w.NotifyChannel)
+	if configured != "" && configured != DefaultNotifyChannel {
+		w.logger().Warn("Worker.NotifyChannel is deprecated and ignored; the job notification channel is library-owned",
+			"configured", configured, "channel", DefaultNotifyChannel)
 	}
-	return strings.TrimSpace(w.NotifyChannel)
 }
 func (w *Worker) concurrency() int {
 	if w.Concurrency < 1 {
