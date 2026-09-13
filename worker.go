@@ -119,6 +119,13 @@ func (w *Worker) Run(ctx context.Context) error {
 	if err := w.validate(); err != nil {
 		return err
 	}
+	w.logger().Info("job queue worker starting",
+		"worker_id", w.workerID(),
+		"queue", w.queue(),
+		"concurrency", w.concurrency(),
+		"lease_duration", w.leaseDuration(),
+		"heartbeat_interval", w.heartbeatInterval(),
+	)
 	consumerCtx, stopConsumers := context.WithCancel(context.Background())
 	defer stopConsumers()
 	wakes := make([]chan struct{}, w.concurrency())
@@ -296,6 +303,7 @@ func (w *Worker) processNext(handlerCtx, lifecycleCtx context.Context) (bool, er
 		return true, w.settle(settleFailure(settleCtx, w.DB, job, diagnostic, nil), job)
 	}
 
+	handlerCtx = withJobInfo(handlerCtx, job, w.workerID())
 	handler, ok := w.Registry.handler(job.Command)
 	var (
 		handlerErr error
@@ -339,7 +347,10 @@ func (w *Worker) logFailure(job Job, err error) {
 		"queue", job.Queue,
 		"command", job.Command,
 		"attempt", job.Attempts,
+		"max_attempts", job.MaxAttempts,
 		"retry_attempt", job.RetryAttempts,
+		"worker_id", w.workerID(),
+		"sequence_key", job.SequenceKey,
 		"error", err,
 	)
 }
