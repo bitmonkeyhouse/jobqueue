@@ -22,25 +22,39 @@ func (d *QueueDispatcher) Dispatch(ctx context.Context, command string, argument
 	if d == nil || d.db == nil {
 		return 0, errors.New("job queue database is required")
 	}
-	return d.dispatch(ctx, d.db, command, arguments, options...)
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin job dispatch: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	id, err := insertJob(ctx, tx, command, arguments, options...)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit job dispatch: %w", err)
+	}
+	return id, nil
 }
 
 func (d *QueueDispatcher) DispatchTx(ctx context.Context, tx *sql.Tx, command string, arguments any, options ...Option) (int64, error) {
 	if tx == nil {
 		return 0, errors.New("job queue transaction is required")
 	}
-	return d.dispatch(ctx, tx, command, arguments, options...)
+	return insertJob(ctx, tx, command, arguments, options...)
 }
 
-func (d *QueueDispatcher) dispatch(ctx context.Context, executor interface {
-	QueryRowContext(context.Context, string, ...any) *sql.Row
-}, command string, arguments any, options ...Option) (int64, error) {
+// insertJob writes the job and its enqueued event in the caller's transaction.
+// An idempotency conflict returns the existing active job's id without a second
+// job or event. xmax=0 identifies a genuinely new row.
+func insertJob(ctx context.Context, tx *sql.Tx, command string, arguments any, options ...Option) (int64, error) {
 	payload, cfg, err := buildPayload(command, arguments, options...)
 	if err != nil {
 		return 0, err
 	}
 	var id int64
-	err = executor.QueryRowContext(ctx, `
+	var inserted bool
+	err = tx.QueryRowContext(ctx, `
 WITH operation AS (SELECT clock_timestamp() AS now)
 INSERT INTO jobs (queue, payload, available_at, retry_until, idempotency_key)
 SELECT $1, $2::jsonb,
@@ -50,9 +64,14 @@ SELECT $1, $2::jsonb,
 FROM operation
 ON CONFLICT (queue, idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('available', 'reserved')
 DO UPDATE SET updated_at = jobs.updated_at
-RETURNING id`, cfg.queue, payload, durationInterval(time.Duration(cfg.delayNanos)), durationInterval(time.Duration(cfg.retryWindowNanos)), cfg.idempotencyKey).Scan(&id)
+RETURNING id, (xmax = 0) AS inserted`, cfg.queue, payload, durationInterval(time.Duration(cfg.delayNanos)), durationInterval(time.Duration(cfg.retryWindowNanos)), cfg.idempotencyKey).Scan(&id, &inserted)
 	if err != nil {
 		return 0, fmt.Errorf("insert job: %w", err)
+	}
+	if inserted {
+		if err := insertEvent(ctx, tx, id, EventEnqueued, map[string]any{"queue": cfg.queue}); err != nil {
+			return 0, err
+		}
 	}
 	return id, nil
 }
@@ -69,6 +88,7 @@ type Job struct {
 	RetryUntil    time.Time
 	ReservedAt    time.Time
 	ReservationID string
+	WorkerID      string
 }
 
 func claimExpiredDeadline(ctx context.Context, db *sql.DB, queue string, reservationExpiry time.Duration) (Job, error) {
@@ -128,14 +148,26 @@ WITH candidate AS (
     ORDER BY available_at ASC, id ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
+),
+claimed AS (
+    UPDATE jobs
+    SET status='reserved', attempts=attempts+1, reserved_at=clock_timestamp(),
+        reservation_id=$3, updated_at=clock_timestamp()
+    FROM candidate
+    WHERE jobs.id=candidate.id
+    RETURNING jobs.id, jobs.queue, jobs.payload, jobs.attempts, jobs.retry_attempts,
+              jobs.available_at, jobs.retry_until, jobs.reserved_at, jobs.reservation_id
+),
+attempt AS (
+    INSERT INTO job_attempts (job_id, queue, attempt, claimed_at)
+    SELECT id, queue, attempts, reserved_at FROM claimed
+),
+event AS (
+    INSERT INTO job_events (job_id, type, detail)
+    SELECT id, 'claimed', jsonb_build_object('attempt', attempts) FROM claimed
 )
-UPDATE jobs
-SET status='reserved', attempts=attempts+1, reserved_at=clock_timestamp(),
-    reservation_id=$3, updated_at=clock_timestamp()
-FROM candidate
-WHERE jobs.id=candidate.id
-RETURNING jobs.id,jobs.queue,jobs.payload,jobs.attempts,jobs.retry_attempts,
-          jobs.available_at,jobs.retry_until,jobs.reserved_at,jobs.reservation_id`, queue, durationInterval(reservationExpiry), reservationID).Scan(
+SELECT id, queue, payload, attempts, retry_attempts, available_at, retry_until, reserved_at, reservation_id
+FROM claimed`, queue, durationInterval(reservationExpiry), reservationID).Scan(
 		&job.ID, &job.Queue, &job.Payload, &job.Attempts, &job.RetryAttempts,
 		&job.AvailableAt, &job.RetryUntil, &job.ReservedAt, &job.ReservationID,
 	)
@@ -180,12 +212,26 @@ func completeJob(ctx context.Context, db *sql.DB, job Job) error {
 		// rather than retrying it because legacy payload redaction failed.
 		redacted = terminalRedactionFallback(job.Command)
 	}
-	result, err := db.ExecContext(ctx, `
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `
 UPDATE jobs
 SET status='completed', payload=$3::jsonb, completed_at=clock_timestamp(),
     reserved_at=NULL, reservation_id=NULL, last_error=NULL, updated_at=clock_timestamp()
 WHERE id=$1 AND status='reserved' AND reservation_id=$2`, job.ID, job.ReservationID, redacted)
-	return fencedResult(result, err)
+	if err := fencedResult(result, err); err != nil {
+		return err
+	}
+	if err := finishAttempt(ctx, tx, job.ID, job.Attempts, OutcomeCompleted, "", ""); err != nil {
+		return err
+	}
+	if err := insertEvent(ctx, tx, job.ID, EventCompleted, attemptDetail(job, "")); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func settleFailure(ctx context.Context, db *sql.DB, job Job, diagnostic failureDiagnostic, retryAfter *time.Duration) error {
@@ -238,6 +284,16 @@ RETURNING status='failed',retry_attempts`, job.ID, job.ReservationID, durationIn
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO job_failures (job_id,queue,command,attempts,retry_attempts,error_code,error_message,terminal)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, job.ID, job.Queue, command, job.Attempts, retryAttempts, diagnostic.Code, diagnostic.Message, terminal); err != nil {
+		return err
+	}
+	if err := finishAttempt(ctx, tx, job.ID, job.Attempts, OutcomeFailed, diagnostic.Code, diagnostic.Message); err != nil {
+		return err
+	}
+	eventType := EventRetryScheduled
+	if terminal {
+		eventType = EventFailed
+	}
+	if err := insertEvent(ctx, tx, job.ID, eventType, attemptDetail(job, diagnostic.Code)); err != nil {
 		return err
 	}
 	return tx.Commit()
