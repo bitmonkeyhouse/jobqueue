@@ -69,13 +69,21 @@ if err := jobqueue.Migrate(context.Background(), db); err != nil {
 }
 ```
 
-It creates the `jobs` and `job_failures` tables (plus a few indexes and a
-notification trigger). It tracks its own schema version in a table called
-`jobqueue_goose_db_version`, so it will **not** clash with any other migration
-tooling you use.
+It creates the `jobs`, `job_failures`, `job_attempts`, `job_events` and
+`job_queues` tables (plus indexes and a notification trigger). It tracks its own
+schema version in a table called `jobqueue_goose_db_version`, so it will **not**
+clash with any other migration tooling you use.
 
 Calling it again later is harmless — it only applies migrations you don't have
 yet.
+
+> **Upgrading from v0.1.0?** v0.2.0 changes how a claimed job is owned (leases)
+> and adds the `cancelled` status. Old reservation-expiry workers and new
+> lease-aware workers must never run against the same database. Drain the queue,
+> stop all old workers, verify there are no `reserved` jobs, then migrate and
+> start the new workers. `Migrate` refuses to cross that boundary while reserved
+> jobs exist (`errors.Is(err, jobqueue.ErrActiveReservations)`). See
+> `docs/release-notes-v0.2.0.md`.
 
 ---
 
@@ -284,6 +292,9 @@ id, err := dispatcher.Dispatch(ctx, "cmd", args,
 | `Sensitive(pointer)` | Mark part of the arguments as secret, so it's scrubbed from the stored payload after the job finishes (see "Secrets" below). |
 | `SensitiveArguments()` | Shorthand to mark **all** arguments as secret. |
 | `Metadata(values)` | Attach arbitrary extra data to the job (a JSON object). |
+| `SequenceKey(key)` | Group related jobs so at most `SequenceConcurrency` of them run at once (`MaxConcurrency` of the queue still applies). |
+| `SequenceConcurrency(n)` | Override the queue's default for this job's sequence key. |
+| `MaxAttempts(n)` | Cap execution claims. `MaxAttempts(1)` means the handler runs at most once; `0` (default) keeps window-bounded retries. |
 
 Defaults when you pass no options:
 
@@ -330,9 +341,10 @@ need more (or less):
 worker.JobTimeout = 2 * time.Minute
 ```
 
-> `JobTimeout` **must** be shorter than `ReservationExpiry` (default 90s). If
-> you raise the timeout, raise the reservation expiry too, or the worker will
-> refuse to start.
+> A lease keeps a claimed job owned while the worker is alive, so long handlers
+> are safe. The old v0.1.0 rule that `JobTimeout` had to be shorter than
+> `ReservationExpiry` no longer applies: the worker renews the lease on
+> `HeartbeatInterval` while the handler runs. See the worker reference below.
 
 ---
 
@@ -391,10 +403,13 @@ the defaults.
 | `DatabaseURL` | *(empty)* | Connection string used for Postgres `LISTEN`/`NOTIFY`. Empty = polling only (still works, just less snappy). |
 | `Registry` | *(required)* | The command → handler registry. |
 | `Queue` | `"default"` | Which queue this worker pulls from. |
-| `NotifyChannel` | `"jobs"` | The Postgres NOTIFY channel. Leave it alone unless you know why. |
+| `NotifyChannel` | *(ignored)* | **Deprecated.** The notification channel is library-owned; a non-default value logs a startup warning and is ignored. |
+| `WorkerID` | `hostname:pid:random` | Stable identity recorded on each claim so operators can see who holds a job. |
 | `Concurrency` | `2` | How many jobs this worker processes at once. |
 | `JobTimeout` | `30s` | Max time one handler gets to finish. |
-| `ReservationExpiry` | `90s` | How long a claimed job stays "reserved" before another worker may steal it. |
+| `LeaseDuration` | `1m` | How long a claim stays owned without a heartbeat before another worker may reclaim it. |
+| `HeartbeatInterval` | `10s` | How often a running job's lease is renewed. Must be shorter than `LeaseDuration`. |
+| `ReservationExpiry` | *(deprecated)* | Alias for the initial `LeaseDuration`. Setting both is an error. |
 | `PollInterval` | `15s` | How often to check for work when there's nothing to do (polling fallback). |
 | `ShutdownGrace` | `35s` | How long in-flight jobs get to finish when the worker is stopped. |
 | `SettlementTimeout` | `5s` | Max time allowed to write a job's final result to the DB. |
@@ -412,7 +427,49 @@ more throughput — jobs are claimed safely so no two workers run the same job.
 
 ---
 
-## 12. How it works (the short version)
+## 12. Cancelling jobs, queue limits and the read API
+
+**Cancel a queued or running job.** Cancellation is durable (stored in Postgres)
+and needs no authorization from the module — that is your application's job:
+
+```go
+result, err := dispatcher.RequestCancel(ctx, jobID)
+// result is one of: cancelled (was queued), requested (was running),
+// already_requested, already_terminal
+```
+
+A queued job is cancelled immediately and never runs. A running job has its
+handler context cancelled and settles as `cancelled`, never `failed`, and never
+retries. A job that already finished is left untouched.
+
+**Limit a queue or serialise related jobs.** Register a queue once, or let the
+first enqueue create it with safe defaults (`requeue` on expiry, unlimited):
+
+```go
+changed, err := jobqueue.RegisterQueue(ctx, db, jobqueue.QueueConfig{
+    Name:               "morpheus.audit",
+    MaxConcurrency:     &maxAudits,
+    ExpiredLeasePolicy: jobqueue.ExpiredLeaseFail,
+})
+```
+
+`RegisterQueue` makes the stored configuration exactly what you pass (it can
+tighten or loosen). `EnsureQueue` creates-if-absent and never mutates. Per-job
+`SequenceKey("project:42")` keeps related jobs sequential while unrelated ones
+run in parallel.
+
+**Read jobs for an admin view.** `GetJob`, `ListJobs`, `CountJobs`,
+`ListAttempts`, `ListEvents` and `QueueStats` return redacted views;
+sensitive arguments are stripped for every status, including running jobs.
+
+**Retention.** `Prune` deletes terminal jobs before a cutoff and cascades their
+history. Nothing is pruned automatically. A 30-day window
+(`jobqueue.RecommendedRetention`) is the documented starting point for queue
+history only.
+
+---
+
+## 13. How it works (the short version)
 
 1. `Dispatch` inserts a row into the `jobs` table and a Postgres trigger sends
    a `NOTIFY`.
@@ -421,15 +478,17 @@ more throughput — jobs are claimed safely so no two workers run the same job.
 3. Handler returns:
    - `nil` → job marked `completed`.
    - error → job made available again after a backoff (or marked `failed`).
-4. A reservation has an expiry, so if a worker **crashes** mid-job, the job
-   becomes claimable again after `ReservationExpiry` instead of being lost.
+4. A claim carries a **lease** that the worker renews while the handler runs. If
+   a worker **crashes** mid-job, the lease expires and `Reap` (or the next
+   claim) recovers the job according to the queue's `expired_lease_policy`:
+   `requeue` (default) or `fail`.
 
 At-least-once delivery: a job **may** run more than once if a worker crashes at
 the wrong moment. Make your handlers tolerate being run twice.
 
 ---
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 **`worker.Run` returns `"job queue database is required"`**
 You forgot `DB`, or the `*sql.DB` is `nil`.
