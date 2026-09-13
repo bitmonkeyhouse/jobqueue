@@ -191,6 +191,10 @@ jobs need not be drained: they are unowned and a new worker picks them up. Only
 
 ### 3.5 Migration rules
 
+**From v0.2.0 the module owns its schema and migrations.** `jobqueue.Migrate` is
+authoritative; consumer-owned copies of jobqueue migrations are legacy and
+deprecated.
+
 - Module migrations stay embedded and monotonic. Add `00002_…`, `00003_…`, etc.;
   never edit an applied migration.
 - `jobqueue_goose_db_version` stays separate from application migration history.
@@ -199,6 +203,10 @@ jobs need not be drained: they are unowned and a new worker picks them up. Only
 - A consumer using its own PostgreSQL schema through `search_path` keeps that
   behaviour; a shared database deployment uses one agreed queue schema and globally
   namespaced queue names.
+- A consumer that copied the v0.1.0 schema instead of calling `Migrate` is handled
+  by the adoption path (§5.10): the copy is recognised, `00001` is stamped, and
+  future schema changes come only from the module. Consumers must not copy
+  `00002`+ into their own migrations.
 
 ---
 
@@ -608,6 +616,36 @@ receives the typed error; after the job is settled, migration succeeds; a v0.2.0
 database with a live reserved job migrates (no-op) without error; a fresh install
 migrates. `available` jobs do not block migration. This makes step 4 of §3.4
 mechanical instead of a runbook hope.
+
+### 5.10.1 Legacy v0.1.0 schema adoption
+
+`Migrate` is safe in three cases:
+
+- **Fresh database** — no module history and no queue schema: migrations apply
+  from version 1 normally.
+- **Module-managed database** — `jobqueue_goose_db_version` exists: normal
+  migrations.
+- **Legacy v0.1.0 database** — the jobqueue schema exists but
+  `jobqueue_goose_db_version` does not: the schema is verified against the
+  recognised v0.1.0 baseline, `00001` is stamped as applied without executing its
+  DDL, and `00002`–`00004` run through the ordinary path, including the guard
+  above. Adoption does not modify existing job data to establish ownership.
+
+The verification is strict and checks tables; required columns and types; primary
+keys; the `job_failures` foreign key (including `ON DELETE RESTRICT`); the status,
+reservation, terminal and payload constraints; the indexes v0.1.0 behaviour
+requires; and the absence of the v0.2.0 columns. Triggers and notification
+functions are deliberately **not** verified: a copied schema may carry a
+consumer-local channel, and migration `00002` replaces it with the library
+trigger. If the schema does not match, `Migrate` fails closed with a typed
+`LegacyAdoptionError` (`errors.Is(err, ErrLegacySchemaUnrecognised)`) listing the
+mismatches. It never stamps optimistically, partially migrates, guesses a version
+or recreates conflicting objects; the operator resolves an unrecognised schema
+manually.
+
+This is a compatibility bridge, not a second migration strategy: from v0.2.0 the
+module-owned migration history is the only supported source of schema evolution
+for every consumer.
 
 ### 5.11 Read / admin API and sensitive payloads
 

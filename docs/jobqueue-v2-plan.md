@@ -47,8 +47,9 @@ Go semantic-major release. No `/v2` import path is introduced.
 ## 2. Migration ownership and numbering
 
 `migrate.go` embeds `migrations/*.sql`, runs goose with the PostgreSQL dialect, and
-uses the separate `jobqueue_goose_db_version` table. The module owns its schema
-migrations; consumers do not copy the SQL into application migrations. A shared
+uses the separate `jobqueue_goose_db_version` table. **From v0.2.0 the module owns
+its schema migrations and is authoritative**; consumers do not copy the SQL into
+application migrations, and consumer-owned copies are legacy/deprecated. A shared
 database uses one agreed queue schema and globally namespaced queue names; a consumer
 using its own `search_path` keeps that behaviour.
 
@@ -60,13 +61,17 @@ Rules:
    adding a nullable column.
 4. `Migrate` runs the pre-flight guard (§ WP4) before applying the breaking migration
    and fails clearly when `reserved` jobs exist.
+5. `Migrate` adopts a legacy v0.1.0 schema that has no `jobqueue_goose_db_version`
+   (WP11): it verifies the schema against the recognised baseline, stamps `00001`
+   without executing its DDL, and continues. Adoption is a compatibility bridge,
+   not an ongoing migration strategy; consumers must not copy `00002`+ SQL.
 
 Migrations introduced by this plan (all part of the unshipped v0.2.0, so all are
 finalised before the release):
 
 | Migration | Contents | Work package |
 | --- | --- | --- |
-| `00002_job_attempts_events.sql` | `job_attempts`, `job_events`, cascade FKs, `job_failures` FK changed from `ON DELETE RESTRICT` to `ON DELETE CASCADE`, indexes | WP1 |
+| `00002_job_attempts_events.sql` | `job_attempts`, `job_events`, cascade FKs, `job_failures` FK changed from `ON DELETE RESTRICT` to `ON DELETE CASCADE`, canonical notification trigger, indexes | WP1 |
 | `00003_queue_registry.sql` | `job_queues`, `jobs.sequence_key`, `jobs.sequence_concurrency`, `jobs.max_attempts`, supporting indexes | WP3 |
 | `00004_leases_and_cancellation.sql` | **Breaking.** `jobs.worker_id`, `heartbeat_at`, `lease_expires_at`, `cancel_requested_at`, `cancelled_at`; `jobs_status_check` extended with `cancelled`; terminal/reservation `CHECK` rewrites; partial-index rewrites; lease and cancellation indexes. Guarded by the migration pre-flight check. | WP4, WP5 |
 
@@ -531,11 +536,17 @@ spec or plan in the repo before this change.
 
 **Required change:**
 
+- implement the legacy adoption path in `Migrate` (WP11 adoption): a v0.1.0 schema
+  without `jobqueue_goose_db_version` is verified against the recognised baseline,
+  `00001` is stamped without executing its DDL, and `00002`–`00004` run through the
+  ordinary guard. Unrecognised schemas fail closed with a typed
+  `LegacyAdoptionError`. Helpers stay internal (`adoptLegacySchema`);
 - update README and package docs with the final API and state machine; migration
   guide from v0.1.0; the required coordinated upgrade procedure and the migration
-  guard; mixed-version rules; worker shutdown rules; cancellation race semantics;
-  lease sizing; idempotency; transactional pgx usage; safe payload diagnostics;
-  library-owned notification channels; the `cancelled` terminal state; and the
+  guard; the legacy adoption bridge and the module-owned-migrations rule; mixed-version
+  rules; worker shutdown rules; cancellation race semantics; lease sizing;
+  idempotency; transactional pgx usage; safe payload diagnostics; library-owned
+  notification channels; the `cancelled` terminal state; and the
   attempts/`retry_attempts` distinction;
 - **search current consumers** for terminal assumptions equivalent to
   `status = 'completed' OR status = 'failed'`,
@@ -545,21 +556,34 @@ spec or plan in the repo before this change.
 - keep `docs/jobqueue-v2-spec.md` and `docs/jobqueue-v2-plan.md` in this repository;
   do not depend on a cross-repository audit document for normative requirements;
 - release notes call out `cancelled` as a new terminal state, `NotifyChannel` as
-  deprecated, and the coordinated-upgrade requirement.
+  deprecated, the coordinated-upgrade requirement, and the module-owned-migrations
+  rule;
+- **adopt IndiFeed**: bump it to v0.2.0; make startup call `jobqueue.Migrate`; leave
+  `20260818000000_create_jobs.sql` in Goose history but mark it historical
+  (superseded by module-owned migrations) and stop treating it as authoritative;
+  remove the obsolete `NotifyChannel` setting; do not copy `00002`–`00004` into
+  IndiFeed. Verify against a database representing the real deployed schema
+  (fixture in `testdata/indifeed_20260818000000_create_jobs.sql`).
 
 **Schema change:** run every migration upgrade check appropriate to release policy.
 Do not promise down migrations that can destroy live history without an explicit
 operator action.
 **Public API change:** publish under v0.2.0 on the existing module path, with the
-indifeed compatibility check.
+indifeed compatibility check. Adoption is internal to `Migrate`; no new public
+migration function is required.
 **Compatibility impact:** announce the coordinated worker upgrade. Update indifeed's
 dependency and tests. Morpheus adopts the pgx and lease APIs after the release.
 
-**Tests:** fresh install; v0.1.0 upgrade with the guard (blocked and unblocked);
-concurrent `Migrate` calls; indifeed compile and test suite; package examples; race
-test where practical; CI PostgreSQL service.
+**Tests:** fresh install; existing module-managed install unchanged; recognised legacy
+schema recognised and `00001` stamped rather than executed; existing data preserved;
+unsafe reserved job reaches the guard and fails without partial application;
+unrecognised schema fails closed without stamping; IndiFeed deployed fixture adopted
+including its differing trigger; v0.1.0 upgrade with the guard (blocked and
+unblocked); concurrent `Migrate` calls; indifeed compile and test suite; package
+examples; race test where practical; CI PostgreSQL service.
 **Acceptance:** a new consumer can understand and operate the queue from the README,
-and existing indifeed deployments have a documented, tested upgrade path.
+and existing indifeed deployments have a documented, tested upgrade path with
+module-owned migrations.
 
 ---
 
@@ -621,7 +645,7 @@ checks with generous margins.
 | Retry | Retryable failure/backoff; jitter bounds; retry-window cutoff; permanent error; max attempts N and 1; killed worker + `MaxAttempts(1)` terminal and never re-executed; failure and attempt history preserved |
 | Shutdown | No claims after shutdown begins; in-flight handler gets grace; handler cancellation after grace; settlement timeout and lease recovery are visible |
 | History | Event sequence resume; ordering; successful and failed attempt duration; cascade prune; counts and filters; safe diagnostics/redaction |
-| Deployment | Fresh migration; v0.1.0 upgrade; migration guard blocks with `reserved` jobs and applies nothing; guard passes when drained; concurrent migration calls; LISTEN disconnect plus polling; at least two PostgreSQL versions in CI |
+| Deployment | Fresh migration; existing module-managed install unchanged; v0.1.0 upgrade; legacy v0.1.0 schema without module history verified, `00001` stamped rather than executed, and data preserved; unrecognised legacy schema fails closed without stamping; IndiFeed deployed fixture adopted including its differing trigger; migration guard blocks with reserved jobs and applies nothing; guard passes when drained; concurrent migration calls; LISTEN disconnect plus polling; at least two PostgreSQL versions in CI |
 | Read API | Filters, pagination, counts; redaction for available/reserved/completed; no raw-payload leak |
 
 ## 5. Deliberately deferred

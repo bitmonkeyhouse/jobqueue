@@ -127,60 +127,71 @@ No other module in the workspace depends on `jobqueue`.
 
 ---
 
-## OPEN — blocking indifeed's schema upgrade
+## Legacy schema adoption (v0.1.0 → module-owned migrations)
 
-**This needs a decision; it changes the documented migration-ownership contract
-and must not be resolved silently.**
+**From v0.2.0 the module owns its schema and migrations.** Consumer-owned copied
+jobqueue migrations are legacy/deprecated; `jobqueue.Migrate` is authoritative.
 
-The v2 plan states that the module owns its schema migrations and consumers call
-`jobqueue.Migrate`. That is true for **steeev/api** but **not for indifeed**:
+`Migrate` is safe in three cases:
 
-- indifeed does **not** call `jobqueue.Migrate`. It carries a full copy of the
-  v0.1.0 schema in its own application migration
-  (`indifeed/db/migrations/20260818000000_create_jobs.sql` — `jobs`,
-  `job_failures`, trigger) applied by indifeed's own goose history
-  (`goose_db_version`).
-- indifeed documents this as intentional:
-  `indifeed/docs/async-jobs.md` — "indifeed's existing local `db/migrations`
-  remain authoritative for this schema and are applied by indifeed, not
-  `jobqueue.Migrate`."
-- indifeed's copied trigger notifies `'shipworth_jobs'`, not `'jobs'`.
+- **Fresh database** — no module history and no queue schema: migrations apply
+  from version 1 normally.
+- **Module-managed database** — `jobqueue_goose_db_version` exists: normal
+  migrations.
+- **Legacy v0.1.0 database** — the jobqueue schema exists but
+  `jobqueue_goose_db_version` does not: the schema is verified against the
+  recognised v0.1.0 baseline, then migration `00001` is stamped as applied
+  without executing its DDL, and migrations `00002`–`00004` run through the
+  ordinary path (including the pending-lease safety guard). Existing data is not
+  modified to establish ownership.
 
-Consequences for v0.2.0:
+The verification checks tables, required columns and types, primary keys, the
+`job_failures` foreign key (including `ON DELETE RESTRICT`), the status,
+reservation and terminal constraints, and the indexes v0.1.0 behaviour requires,
+and requires the v0.2.0 columns to be absent. Triggers and notification channels
+are deliberately not verified: a copied schema may carry a consumer-local
+channel, and migration `00002` replaces it with the library trigger.
 
-1. indifeed will not receive migrations `00002`–`00004` from `Migrate`. Without
-   equivalent migrations its `jobs` table lacks `job_attempts`, `job_events`,
-   `job_queues`, `worker_id`, `lease_expires_at`, `cancel_requested_at`,
-   `cancelled_at`, `sequence_key` and `max_attempts`, so v0.2.0 runtime code
-   fails on the first claim.
-2. indifeed cannot simply start calling `jobqueue.Migrate`: its `jobs` table was
-   created under `goose_db_version`, while the module tracks
-   `jobqueue_goose_db_version`. The module would try to apply `00001` and fail on
-   the pre-existing objects. The two migration histories must be reconciled
-   first.
-3. The drain-before-upgrade guard lives in `jobqueue.Migrate`, which indifeed
-   never calls, so indifeed gets no automatic safety check.
+If an existing jobqueue-like schema does not match the baseline, `Migrate` fails
+closed with a typed `LegacyAdoptionError` (`errors.Is(err,
+ErrLegacySchemaUnrecognised)`) listing every mismatch. The module never stamps
+optimistically, partially migrates, guesses a version or recreates conflicting
+objects; the operator resolves an unrecognised schema manually.
 
-### Options
+### IndiFeed adoption
 
-**A. indifeed keeps owning its schema; copy migrations `00002`–`00004` into
-`indifeed/db/migrations`.**
-Smallest operational change, preserves indifeed's stated model. Cost: two
-schemas kept in sync by hand forever, and indifeed must reimplement the
-upgrade guard (or rely on the documented manual drain).
+IndiFeed carries a copy of the v0.1.0 schema in
+`indifeed/db/migrations/20260818000000_create_jobs.sql`, applied under IndiFeed's
+own `goose_db_version`, and does not currently call `jobqueue.Migrate`. Its
+deployed schema matches the canonical v0.1.0 baseline except for the notification
+trigger (`notify_shipworth_job` → `shipworth_jobs`), which adoption deliberately
+ignores and migration `00002` replaces. `testdata/indifeed_20260818000000_create_jobs.sql`
+is a fixture of that exact deployed migration and is exercised by the adoption
+tests.
 
-**B. indifeed adopts `jobqueue.Migrate` and retires its copy.**
-Single source of truth. Cost: reconcile the two goose histories — seed
-`jobqueue_goose_db_version` with version 1 (mark `00001` applied) and neutralize
-the already-applied local `create_jobs` migration, or add module support for
-adopting an existing v0.1.0 schema. This is the only option that makes the
-module's guard effective for indifeed.
+Supported IndiFeed upgrade:
 
-**C. Add a module-supported adoption path** (e.g. `Migrate` detects an existing
-v0.1.0 `jobs` table with no module history and stamps `00001` as applied before
-applying `00002`+). Makes option B safe and repeatable for any consumer that
-copied v0.1.0. Cost: new behaviour in `Migrate` and a new test surface.
+```text
+stop accepting new queue work
+→ drain queued/reserved work as required
+→ stop every v0.1.0 worker
+→ verify no reserved jobs
+→ deploy version containing jobqueue v0.2.0
+→ jobqueue.Migrate adopts the recognised v0.1.0 schema
+→ pending lease migration guard passes
+→ migrations 00002–00004 apply
+→ start v0.2.0 workers
+→ resume work
+```
 
-Until this is decided, indifeed stays on v0.1.0 and its dependency must not be
-bumped. The reusable module (WP0–WP10) is complete and green; only indifeed's
-upgrade steps (WP11) and Morpheus integration (WP12) depend on this decision.
+v0.1.0 and v0.2.0 workers must never operate concurrently.
+
+After adoption:
+
+1. IndiFeed calls `jobqueue.Migrate` at startup.
+2. `20260818000000_create_jobs.sql` is historical only; it was already deployed
+   and must not be erased or rewritten in IndiFeed's goose history.
+3. Future jobqueue schema changes come **only** from `jobqueue.Migrate`; migrations
+   `00002`–`00004` are not copied into IndiFeed.
+4. The obsolete `NotifyChannel` setting is removed, since the module owns
+   notification channels.
