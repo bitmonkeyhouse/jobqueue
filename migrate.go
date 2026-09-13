@@ -40,16 +40,18 @@ func (e *MigrationSafetyError) Unwrap() error { return ErrActiveReservations }
 // Migrate applies this module's schema to db using an isolated goose history
 // table. Call it once at startup, before any Worker or Dispatcher runs.
 //
-// It fails closed with a MigrationSafetyError when, and only when, the pending
-// lease migration cannot be applied safely because reserved jobs exist. Once
-// that migration has been applied, later calls never reject startup just because
-// jobs are running.
+// It is safe for a fresh database, an already module-managed database, and a
+// legacy v0.1.0 database that has the jobqueue schema but no
+// jobqueue_goose_db_version (which is verified and adopted).
+//
+// It fails closed with a MigrationSafetyError when the pending lease migration
+// cannot be applied safely because reserved jobs exist, and with a
+// LegacyAdoptionError when an existing jobqueue-like schema is not a recognised
+// v0.1.0 baseline. Once the lease migration has been applied, later calls never
+// reject startup just because jobs are running.
 func Migrate(ctx context.Context, db *sql.DB) error {
 	if db == nil {
 		return fmt.Errorf("job queue database is required")
-	}
-	if err := checkLeaseMigrationSafety(ctx, db); err != nil {
-		return err
 	}
 	fsys, err := fs.Sub(migrationsFS, "migrations")
 	if err != nil {
@@ -59,6 +61,16 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 		goose.WithTableName(MigrationTable))
 	if err != nil {
 		return fmt.Errorf("create job queue migration provider: %w", err)
+	}
+	// A v0.1.0 schema that predates module-owned migrations is adopted here,
+	// before any migration runs: existing objects are verified against the
+	// recognised baseline and migration 00001 is stamped as applied. Fresh and
+	// module-managed databases are untouched.
+	if err := adoptLegacySchema(ctx, db); err != nil {
+		return err
+	}
+	if err := checkLeaseMigrationSafety(ctx, db); err != nil {
+		return err
 	}
 	if _, err := provider.Up(ctx); err != nil {
 		return fmt.Errorf("apply job queue migrations: %w", err)

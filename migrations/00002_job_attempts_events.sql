@@ -63,6 +63,21 @@ CREATE INDEX idx_job_events_recent ON job_events (at DESC, seq DESC);
 ALTER TABLE job_failures DROP CONSTRAINT job_failures_job_id_fkey;
 ALTER TABLE job_failures ADD CONSTRAINT job_failures_job_id_fkey
     FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE;
+
+-- The module owns the job notification trigger and channel. A legacy schema may
+-- carry a consumer-local trigger/channel; replace it so wake-ups reach the
+-- library channel. Triggers are intentionally not part of legacy baseline
+-- verification, precisely because this migration normalises them.
+DROP TRIGGER IF EXISTS jobs_notify_after_insert ON jobs;
+CREATE OR REPLACE FUNCTION notify_job() RETURNS trigger AS $$
+BEGIN
+    PERFORM pg_notify('jobs', NEW.queue);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER jobs_notify_after_insert
+AFTER INSERT ON jobs
+FOR EACH ROW EXECUTE FUNCTION notify_job();
 -- +goose StatementEnd
 
 -- +goose Down
