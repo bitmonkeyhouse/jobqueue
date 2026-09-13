@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -63,6 +64,23 @@ func (r *Registry) handler(command string) (Handler, bool) {
 // trigger and the worker listener use by default.
 const DefaultNotifyChannel = "jobs"
 
+// defaultWorkerIdentity is generated once per process: hostname, pid and a
+// random suffix, so an operator can tell which process holds a job.
+var defaultWorkerIdentity = sync.OnceValue(func() string {
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		host = "unknown-host"
+	}
+	suffix, err := newReservationID()
+	if err != nil {
+		suffix = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	if len(suffix) > 8 {
+		suffix = suffix[:8]
+	}
+	return fmt.Sprintf("%s:%d:%s", host, os.Getpid(), suffix)
+})
+
 type Worker struct {
 	DB                *sql.DB
 	DatabaseURL       string
@@ -72,6 +90,9 @@ type Worker struct {
 	Concurrency       int
 	JobTimeout        time.Duration
 	ReservationExpiry time.Duration
+	LeaseDuration     time.Duration
+	HeartbeatInterval time.Duration
+	WorkerID          string
 	PollInterval      time.Duration
 	ShutdownGrace     time.Duration
 	SettlementTimeout time.Duration
@@ -102,6 +123,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 
 	notifications := w.startListener(consumerCtx)
+	go w.runReaper(consumerCtx)
 	broadcastWake(wakes)
 
 	var runErr error
@@ -241,7 +263,7 @@ func (w *Worker) processNext(handlerCtx, lifecycleCtx context.Context) (bool, er
 		diagnostic := failureDiagnostic{Code: "invalid_payload", Message: "job payload could not be decoded"}
 		return true, w.settle(settleFailure(settleCtx, w.DB, expired, diagnostic, nil), expired)
 	}
-	job, err := claimNext(lifecycleCtx, w.DB, w.queue(), w.reservationExpiry())
+	job, err := claimNextFor(lifecycleCtx, w.DB, w.queue(), w.leaseDuration(), w.workerID())
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -261,12 +283,14 @@ func (w *Worker) processNext(handlerCtx, lifecycleCtx context.Context) (bool, er
 	if !ok {
 		handlerErr = Permanent(Diagnostic("unknown_command", "no handler is registered for the job command", errors.New("unknown job command")))
 	} else {
-		jobCtx, cancel := context.WithTimeout(handlerCtx, w.jobTimeout())
+		leaseCtx, stopHeartbeat := w.startHeartbeat(handlerCtx, job)
+		jobCtx, cancel := context.WithTimeout(leaseCtx, w.jobTimeout())
 		handlerErr = handler(jobCtx, job.Arguments)
 		if handlerErr == nil {
 			handlerErr = jobCtx.Err()
 		}
 		cancel()
+		stopHeartbeat()
 	}
 	settleCtx, cancel := context.WithTimeout(context.Background(), w.settlementTimeout())
 	defer cancel()
@@ -349,8 +373,11 @@ func (w *Worker) validate() error {
 	if w.Registry == nil {
 		return errors.New("job handler registry is required")
 	}
-	if w.jobTimeout() >= w.reservationExpiry() {
-		return errors.New("job timeout must be shorter than reservation expiry")
+	if w.LeaseDuration > 0 && w.ReservationExpiry > 0 {
+		return errors.New("set LeaseDuration or the deprecated ReservationExpiry, not both")
+	}
+	if w.heartbeatInterval() >= w.leaseDuration() {
+		return errors.New("job heartbeat interval must be shorter than the lease duration")
 	}
 	return nil
 }
@@ -379,10 +406,32 @@ func (w *Worker) jobTimeout() time.Duration {
 	return w.JobTimeout
 }
 func (w *Worker) reservationExpiry() time.Duration {
-	if w.ReservationExpiry <= 0 {
-		return 90 * time.Second
+	// Deprecated alias: reservation expiry is now the initial lease duration.
+	return w.leaseDuration()
+}
+
+func (w *Worker) leaseDuration() time.Duration {
+	if w.LeaseDuration > 0 {
+		return w.LeaseDuration
 	}
-	return w.ReservationExpiry
+	if w.ReservationExpiry > 0 {
+		return w.ReservationExpiry
+	}
+	return time.Minute
+}
+
+func (w *Worker) heartbeatInterval() time.Duration {
+	if w.HeartbeatInterval > 0 {
+		return w.HeartbeatInterval
+	}
+	return 10 * time.Second
+}
+
+func (w *Worker) workerID() string {
+	if id := strings.TrimSpace(w.WorkerID); id != "" {
+		return id
+	}
+	return defaultWorkerIdentity()
 }
 func (w *Worker) pollInterval() time.Duration {
 	if w.PollInterval <= 0 {
@@ -407,6 +456,100 @@ func (w *Worker) logger() *slog.Logger {
 		return w.Logger
 	}
 	return slog.Default()
+}
+
+// startHeartbeat renews the claimed job's lease on an interval until the
+// returned stop func is called. If the lease is genuinely lost (the claim was
+// reclaimed by another owner), it records lease_lost and cancels the returned
+// context so the handler stops. Transient database errors are retried.
+func (w *Worker) startHeartbeat(parent context.Context, job Job) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(w.heartbeatInterval())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				err := w.renewLease(ctx, job)
+				if err == nil {
+					continue
+				}
+				if !errors.Is(err, ErrStaleReservation) {
+					w.logger().Warn("job lease renewal failed", "job_id", job.ID, "queue", job.Queue, "error", err)
+					continue
+				}
+				w.logger().Warn("job lease lost; cancelling handler",
+					"job_id", job.ID, "queue", job.Queue, "worker_id", w.workerID())
+				w.recordLeaseLost(job)
+				cancel()
+				return
+			}
+		}
+	}()
+	return ctx, func() {
+		cancel()
+		<-done
+	}
+}
+
+func (w *Worker) renewLease(ctx context.Context, job Job) error {
+	result, err := w.DB.ExecContext(ctx, `
+UPDATE jobs
+SET lease_expires_at=clock_timestamp() + $3::interval,
+    heartbeat_at=clock_timestamp(), updated_at=clock_timestamp()
+WHERE id=$1 AND status='reserved' AND reservation_id=$2 AND worker_id=$4`,
+		job.ID, job.ReservationID, durationInterval(w.leaseDuration()), w.workerID())
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return ErrStaleReservation
+	}
+	if _, err := w.DB.ExecContext(ctx, `
+UPDATE job_attempts SET heartbeat_at=clock_timestamp()
+WHERE job_id=$1 AND attempt=$2 AND outcome IS NULL`, job.ID, job.Attempts); err != nil {
+		return err
+	}
+	return insertEvent(ctx, w.DB, job.ID, EventLeaseRenewed, map[string]any{
+		"attempt":   job.Attempts,
+		"worker_id": w.workerID(),
+	})
+}
+
+func (w *Worker) recordLeaseLost(job Job) {
+	ctx, cancel := context.WithTimeout(context.Background(), w.settlementTimeout())
+	defer cancel()
+	if err := insertEvent(ctx, w.DB, job.ID, EventLeaseLost, map[string]any{
+		"attempt":   job.Attempts,
+		"worker_id": w.workerID(),
+	}); err != nil {
+		w.logger().Warn("record job lease loss failed", "job_id", job.ID, "queue", job.Queue, "error", err)
+	}
+}
+
+// runReaper periodically reconciles expired leases for this worker's queue so
+// an abandoned job is handled by policy even when no worker claims again.
+func (w *Worker) runReaper(ctx context.Context) {
+	ticker := time.NewTicker(w.heartbeatInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := Reap(ctx, w.DB, ReapOptions{Queues: []string{w.queue()}}); err != nil && ctx.Err() == nil {
+				w.logger().Warn("job queue reap failed", "queue", w.queue(), "error", err)
+			}
+		}
+	}
 }
 
 func retryBackoff(attempt int) time.Duration {

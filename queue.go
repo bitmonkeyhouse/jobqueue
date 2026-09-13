@@ -151,7 +151,16 @@ RETURNING jobs.id,jobs.queue,jobs.payload,jobs.attempts,jobs.retry_attempts,
 	return job, nil
 }
 
-func claimNext(ctx context.Context, db *sql.DB, queue string, reservationExpiry time.Duration) (Job, error) {
+func claimNext(ctx context.Context, db *sql.DB, queue string, lease time.Duration) (Job, error) {
+	return claimNextFor(ctx, db, queue, lease, "")
+}
+
+// claimNextFor claims the oldest eligible job for queue. It only steals a
+// reserved row whose lease has expired, and only when the queue's expired-lease
+// policy is requeue and the attempt cap is not exhausted. A NULL lease counts as
+// expired so no row is unreclaimable. workerID is recorded as the owner and the
+// claim is granted a fresh lease.
+func claimNextFor(ctx context.Context, db *sql.DB, queue string, lease time.Duration, workerID string) (Job, error) {
 	reservationID, err := newReservationID()
 	if err != nil {
 		return Job{}, err
@@ -176,20 +185,25 @@ WITH candidate AS (
     JOIN job_queues q ON q.name = j.queue
     WHERE j.queue = $1
       AND j.retry_until >= clock_timestamp()
+      AND (j.max_attempts = 0 OR j.attempts < j.max_attempts)
       AND (
         (j.status = 'available' AND j.available_at <= clock_timestamp())
-        OR (j.status = 'reserved' AND j.reserved_at <= clock_timestamp() - $2::interval)
+        OR (j.status = 'reserved'
+            AND q.expired_lease_policy = 'requeue'
+            AND (j.lease_expires_at IS NULL OR j.lease_expires_at < clock_timestamp()))
       )
       AND (
         q.max_concurrency IS NULL
         OR (SELECT count(*) FROM jobs r
-            WHERE r.queue = j.queue AND r.status = 'reserved') < q.max_concurrency
+            WHERE r.queue = j.queue AND r.status = 'reserved'
+              AND r.lease_expires_at >= clock_timestamp()) < q.max_concurrency
       )
       AND (
         j.sequence_key IS NULL
         OR (SELECT count(*) FROM jobs r
             WHERE r.queue = j.queue AND r.sequence_key = j.sequence_key
-              AND r.status = 'reserved') < j.sequence_concurrency
+              AND r.status = 'reserved'
+              AND r.lease_expires_at >= clock_timestamp()) < j.sequence_concurrency
       )
     ORDER BY j.available_at ASC, j.id ASC
     FOR UPDATE SKIP LOCKED
@@ -198,27 +212,33 @@ WITH candidate AS (
 claimed AS (
     UPDATE jobs
     SET status='reserved', attempts=attempts+1, reserved_at=clock_timestamp(),
-        reservation_id=$3, updated_at=clock_timestamp()
+        reservation_id=$3, worker_id=NULLIF($4, ''),
+        heartbeat_at=clock_timestamp(), lease_expires_at=clock_timestamp() + $2::interval,
+        updated_at=clock_timestamp()
     FROM candidate
     WHERE jobs.id=candidate.id
     RETURNING jobs.id, jobs.queue, jobs.payload, jobs.attempts, jobs.retry_attempts,
               jobs.max_attempts, jobs.available_at, jobs.retry_until, jobs.reserved_at,
-              jobs.reservation_id, jobs.sequence_key, jobs.sequence_concurrency
+              jobs.reservation_id, COALESCE(jobs.worker_id, '') AS worker_id, jobs.sequence_key,
+              jobs.sequence_concurrency
 ),
 attempt AS (
-    INSERT INTO job_attempts (job_id, queue, attempt, claimed_at)
-    SELECT id, queue, attempts, reserved_at FROM claimed
+    INSERT INTO job_attempts (job_id, queue, attempt, worker_id, claimed_at)
+    SELECT id, queue, attempts, NULLIF($4, ''), reserved_at FROM claimed
 ),
 event AS (
     INSERT INTO job_events (job_id, type, detail)
-    SELECT id, 'claimed', jsonb_build_object('attempt', attempts) FROM claimed
+    SELECT id, 'claimed', jsonb_strip_nulls(
+        jsonb_build_object('attempt', attempts, 'worker_id', NULLIF($4, '')))
+    FROM claimed
 )
 SELECT id, queue, payload, attempts, retry_attempts, max_attempts, available_at,
-       retry_until, reserved_at, reservation_id, COALESCE(sequence_key, ''), sequence_concurrency
-FROM claimed`, queue, durationInterval(reservationExpiry), reservationID).Scan(
+       retry_until, reserved_at, reservation_id, worker_id,
+       COALESCE(sequence_key, ''), sequence_concurrency
+FROM claimed`, queue, durationInterval(lease), reservationID, workerID).Scan(
 		&job.ID, &job.Queue, &job.Payload, &job.Attempts, &job.RetryAttempts,
 		&job.MaxAttempts, &job.AvailableAt, &job.RetryUntil, &job.ReservedAt,
-		&job.ReservationID, &job.SequenceKey, &job.SequenceConcurrency,
+		&job.ReservationID, &job.WorkerID, &job.SequenceKey, &job.SequenceConcurrency,
 	)
 	if err != nil {
 		return Job{}, err

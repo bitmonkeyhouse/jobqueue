@@ -227,7 +227,7 @@ func TestClaimExclusivityExpiryDelayAndStaleFencing(t *testing.T) {
 	if _, err := claimNext(context.Background(), db, DefaultQueue, 90*time.Second); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("simultaneous second claim error = %v", err)
 	}
-	if _, err := db.Exec(`UPDATE jobs SET reserved_at=clock_timestamp()-interval '91 seconds'`); err != nil {
+	if _, err := db.Exec(`UPDATE jobs SET lease_expires_at=clock_timestamp()-interval '1 second'`); err != nil {
 		t.Fatal(err)
 	}
 	second, err := claimNext(context.Background(), db, DefaultQueue, 90*time.Second)
@@ -256,7 +256,7 @@ func TestReservationReclaimsDoNotAdvanceHandlerFailureBackoff(t *testing.T) {
 	if _, err := claimNext(context.Background(), db, DefaultQueue, 90*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE jobs SET reserved_at=clock_timestamp()-interval '91 seconds'`); err != nil {
+	if _, err := db.Exec(`UPDATE jobs SET lease_expires_at=clock_timestamp()-interval '1 second'`); err != nil {
 		t.Fatal(err)
 	}
 	before := time.Now()
@@ -770,7 +770,7 @@ func TestTimeoutUnknownMalformedAndExpiredFailureCodes(t *testing.T) {
 	if _, err := db.Exec(`UPDATE jobs SET available_at=clock_timestamp()-interval '2 seconds',retry_until=clock_timestamp()-interval '1 second' WHERE id=$1`, expiredID); err != nil {
 		t.Fatal(err)
 	}
-	worker := &Worker{DB: db, Registry: registry, JobTimeout: time.Millisecond, ReservationExpiry: time.Second}
+	worker := &Worker{DB: db, Registry: registry, JobTimeout: time.Millisecond, ReservationExpiry: time.Second, HeartbeatInterval: 100 * time.Millisecond}
 	for range 3 {
 		if processed, err := worker.ProcessNext(context.Background()); err != nil || !processed {
 			t.Fatalf("ProcessNext = %v, %v", processed, err)
