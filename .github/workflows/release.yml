@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: release
+  queue: max
+
+jobs:
+  release:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Release merged PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" |
+            jq -c --arg sha "$GITHUB_SHA" 'first(.[] | select(.merged_at != null and .merge_commit_sha == $sha))')
+          if [ -z "$pr" ]; then
+            echo 'Not a merged PR; skipping release.'
+            exit 0
+          fi
+
+          latest=$(git tag --list 'v*' | awk '/^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/' | sort -V | tail -n 1)
+          notes=(--generate-notes)
+          if [ -n "$latest" ]; then
+            notes+=(--notes-start-tag "$latest")
+          else
+            latest=v0.2.0
+          fi
+          IFS=. read -r major minor patch <<< "${latest#v}"
+          if jq -e 'any(.labels[]; .name == "semver:major")' <<< "$pr" > /dev/null; then
+            major=$((major + 1)); minor=0; patch=0
+          elif jq -e 'any(.labels[]; .name == "semver:minor")' <<< "$pr" > /dev/null; then
+            minor=$((minor + 1)); patch=0
+          else
+            patch=$((patch + 1))
+          fi
+
+          gh release create "v$major.$minor.$patch" --target main "${notes[@]}"

@@ -345,7 +345,7 @@ func queryStrings(t *testing.T, db *sql.DB, query string, args ...any) []string 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	values := make([]string, 0)
 	for rows.Next() {
 		var value string
