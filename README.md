@@ -10,7 +10,7 @@ If you know how to write a Go function, you know how to use this.
 
 ## What you need
 
-- **Go 1.26 or newer** (check with `go version`)
+- **Go 1.27 or newer** (check with `go version`)
 - **A running PostgreSQL** (any modern version; 14+ is a safe bet)
 - The ability to import the module (network access to GitHub)
 
