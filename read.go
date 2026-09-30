@@ -66,10 +66,6 @@ type QueueStat struct {
 	OldestAvailableAt *time.Time
 }
 
-var validStatuses = map[string]struct{}{
-	"available": {}, "reserved": {}, "completed": {}, "failed": {}, "cancelled": {},
-}
-
 const (
 	defaultJobLimit   = 100
 	maxJobLimit       = 1000
@@ -122,7 +118,7 @@ func (d *QueueDispatcher) ListJobs(ctx context.Context, filter JobFilter) ([]Job
 	if err != nil {
 		return nil, fmt.Errorf("list jobs: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	views := make([]JobView, 0)
 	for rows.Next() {
 		view, err := scanJobView(rows)
@@ -176,7 +172,7 @@ func (d *QueueDispatcher) CountJobs(ctx context.Context, filter JobFilter) ([]Jo
 	if err != nil {
 		return nil, fmt.Errorf("count jobs: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	counts := make([]JobCount, 0)
 	for rows.Next() {
 		var count JobCount
@@ -200,7 +196,7 @@ FROM job_attempts WHERE job_id=$1 ORDER BY attempt`, jobID)
 	if err != nil {
 		return nil, fmt.Errorf("list attempts: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	attempts := make([]JobAttempt, 0)
 	for rows.Next() {
 		var attempt JobAttempt
@@ -243,7 +239,7 @@ FROM job_events WHERE job_id=$1 AND seq > $2 ORDER BY seq LIMIT $3`,
 	if err != nil {
 		return nil, fmt.Errorf("list events: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	events := make([]JobEvent, 0)
 	for rows.Next() {
 		var event JobEvent
@@ -279,7 +275,7 @@ FROM jobs`
 	if err != nil {
 		return nil, fmt.Errorf("queue stats: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	stats := make([]QueueStat, 0)
 	for rows.Next() {
 		var stat QueueStat

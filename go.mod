@@ -1,4 +1,4 @@
-module git.bit-monkey.io/bitmonkey/jobqueue
+module github.com/bitmonkeyhouse/jobqueue
 
 go 1.26
 

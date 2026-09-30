@@ -12,8 +12,7 @@ If you know how to write a Go function, you know how to use this.
 
 - **Go 1.26 or newer** (check with `go version`)
 - **A running PostgreSQL** (any modern version; 14+ is a safe bet)
-- The ability to import the module (network access to
-  `git.bit-monkey.io`)
+- The ability to import the module (network access to GitHub)
 
 No Redis, no RabbitMQ, no separate service. It's just Postgres and your app.
 
@@ -24,10 +23,12 @@ No Redis, no RabbitMQ, no separate service. It's just Postgres and your app.
 In your Go project, run:
 
 ```bash
-go get git.bit-monkey.io/bitmonkey/jobqueue
+go get github.com/bitmonkeyhouse/jobqueue
 ```
 
-That's it. No other setup.
+Existing users must update imports from `git.bit-monkey.io/bitmonkey/jobqueue` to
+`github.com/bitmonkeyhouse/jobqueue`; the module path change requires a new release
+on GitHub (the existing v0.1.0/v0.2.0 tags use the old path).
 
 ---
 
@@ -62,7 +63,7 @@ Before you can enqueue or process jobs, the queue's tables must exist. Call
 `Migrate` **once, at startup**, before anything else uses the queue:
 
 ```go
-import "git.bit-monkey.io/bitmonkey/jobqueue"
+import "github.com/bitmonkeyhouse/jobqueue"
 
 if err := jobqueue.Migrate(context.Background(), db); err != nil {
     log.Fatal(err)
@@ -201,7 +202,7 @@ import (
     "time"
 
     _ "github.com/jackc/pgx/v5/stdlib"
-    "git.bit-monkey.io/bitmonkey/jobqueue"
+    "github.com/bitmonkeyhouse/jobqueue"
 )
 
 const dsn = "postgres://user:password@localhost:5432/mydb?sslmode=disable"
@@ -321,7 +322,7 @@ Some errors will never fix themselves (bad input, missing account, etc.).
 Wrap them with `Permanent` and the job is **failed immediately, no retry**:
 
 ```go
-import "git.bit-monkey.io/bitmonkey/jobqueue"
+import "github.com/bitmonkeyhouse/jobqueue"
 
 func chargeCard(ctx context.Context, arguments []byte) error {
     if cardIsExpired() {

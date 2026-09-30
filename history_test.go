@@ -14,7 +14,7 @@ func eventTypes(t *testing.T, db *sql.DB, jobID int64) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var types []string
 	for rows.Next() {
 		var value string

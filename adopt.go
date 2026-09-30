@@ -290,7 +290,7 @@ WHERE table_schema = current_schema() AND table_name = $1`, table)
 	if err != nil {
 		return nil, fmt.Errorf("inspect %s columns: %w", table, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	columns := make(map[string]columnSpec)
 	for rows.Next() {
 		var name, dataType, nullable string
@@ -309,7 +309,7 @@ WHERE schemaname = current_schema() AND tablename = $1`, table)
 	if err != nil {
 		return nil, fmt.Errorf("inspect %s indexes: %w", table, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	indexes := make(map[string]bool)
 	for rows.Next() {
 		var name string
@@ -329,7 +329,7 @@ WHERE conrelid = $1::regclass`, table)
 	if err != nil {
 		return nil, fmt.Errorf("inspect %s constraints: %w", table, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	constraints := make(map[string]string)
 	for rows.Next() {
 		var name, definition string
